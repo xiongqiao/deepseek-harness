@@ -54,6 +54,7 @@ function appendEmptyAssistantMessage(session: Session, turn: number, step: numbe
 function totals(overrides: Partial<SessionStatsProjection> = {}): SessionStatsProjection {
   return {
     turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0,
+    recentSteps: 0, recentDecodeMs: 0, recentDecodeTokens: 0,
     ...overrides,
   }
 }
@@ -177,6 +178,132 @@ function fold(events: readonly SessionEvent[]): SessionStatsProjection {
   return sessionStatsProjectionDefinition.wire.view(state)
 }
 
+/** Fold `events` starting from an existing fold state (a resumed checkpoint). */
+function foldFrom(
+  start: Parameters<typeof sessionStatsProjectionDefinition.apply>[0],
+  events: readonly SessionEvent[],
+): SessionStatsProjection {
+  const state = events.reduce(
+    (folded, event) => sessionStatsProjectionDefinition.apply(folded, event),
+    start,
+  )
+  return sessionStatsProjectionDefinition.wire.view(state)
+}
+
+/**
+ * The recent-decode window is a BOUNDED ring of the last N decode-timed steps,
+ * so it carries history and cannot be an optional addition: a row written before
+ * the field existed has no window to continue from, and replaying a tail over it
+ * cannot equal a full fold. The projection contract demands a version bump
+ * exactly when that equivalence fails, so `stateVersion` went 1 → 2 and the
+ * window is REQUIRED in the state schema. A v1 row therefore fails
+ * `stateSchema.parse` and is refolded.
+ */
+describe('sessionStats recent-decode window required a stateVersion bump', () => {
+  const message = createMessage({
+    role: 'assistant',
+    content: [{ type: 'text', text: 'answer' }],
+    source: { kind: 'model', provider: 'mock', model: 'mock' },
+  })
+
+  /** One fully recorded step starting and ending at controlled times. */
+  function step(
+    start: number, firstToken: number, end: number, outputTokens: number | null,
+  ): SessionEvent[] {
+    return [
+      at(start, 'step/start', { turn: 1, step: 1 }),
+      at(end, 'assistant/message', {
+        turn: 1,
+        step: 1,
+        message,
+        stream: [{ type: 'chunk', time: firstToken, chunk: { type: 'text-delta', index: 0, text: 'a' } }],
+        ...outputTokens === null ? {} : { usage: { inputTokens: 1, outputTokens } },
+      }),
+      at(end + 1, 'step/end', { turn: 1, step: 1 }),
+    ]
+  }
+
+  it('is version 2, not an optional addition to stateVersion 1', () => {
+    expect(sessionStatsProjectionDefinition.stateVersion).toBe(2)
+  })
+
+  it('rejects a v1 state row so the store refolds instead of serving no window', () => {
+    // The exact shape `checkpoint()` wrote at stateVersion 1: totals plus the
+    // boundary fields, with no recent-decode window.
+    const v1Row = {
+      turns: 1, steps: 1, llmMs: 3_000, toolMs: 0, ttftMs: 500, ttftSteps: 1,
+      decodeMs: 2_500, decodeTokens: 100,
+      lastTurn: 1, openStep: null, pendingCalls: {},
+    }
+    expect(sessionStatsProjectionDefinition.stateSchema.safeParse(v1Row).success).toBe(false)
+  })
+
+  it('accepts a v2 state row carrying the window', () => {
+    const v2Row = {
+      turns: 1, steps: 1, llmMs: 3_000, toolMs: 0, ttftMs: 500, ttftSteps: 1,
+      decodeMs: 2_500, decodeTokens: 100,
+      lastTurn: 1, openStep: null, pendingCalls: {},
+      recent: [{ ms: 2_500, tokens: 100 }],
+      recentPending: null,
+    }
+    expect(sessionStatsProjectionDefinition.stateSchema.safeParse(v2Row).success).toBe(true)
+  })
+
+  it('resumes a v2 row into the same view a full fold produces', () => {
+    const older = step(1_000, 1_500, 4_000, 100)
+    const tail = step(10_000, 10_500, 13_000, 40)
+    const v2Row = {
+      turns: 1, steps: 1, llmMs: 3_000, toolMs: 0, ttftMs: 500, ttftSteps: 1,
+      decodeMs: 2_500, decodeTokens: 100,
+      lastTurn: 1, openStep: null, pendingCalls: {},
+      recent: [{ ms: 2_500, tokens: 100 }],
+      recentPending: null,
+    }
+    const resumed = foldFrom(v2Row, tail)
+    const full = fold([...older, ...tail])
+    expect(resumed).toEqual(full)
+    // Both decode-timed steps are in the window.
+    expect(resumed.recentSteps).toBe(2)
+    expect(resumed.recentDecodeTokens).toBe(140)
+  })
+
+  it('leaves the window intact when a step reports no decode timing', () => {
+    const timed = step(1_000, 1_500, 4_000, 100)
+    // A usage-less step keeps whole-log totals honest but cannot join the window;
+    // a tool-only step must not blank the reading either.
+    const untimed = step(5_000, 5_500, 8_000, null)
+    const value = fold([...timed, ...untimed])
+    expect(value.decodeTokens).toBe(100)
+    expect(value.recentSteps).toBe(1)
+    expect(value.recentDecodeTokens).toBe(100)
+  })
+
+  it('accumulates consecutive decode-timed steps', () => {
+    const value = fold([...step(1_000, 1_500, 4_000, 100), ...step(5_000, 5_500, 8_000, 60)])
+    expect(value.recentSteps).toBe(2)
+    expect(value.recentDecodeTokens).toBe(160)
+    expect(value.recentDecodeMs).toBe(5_000)
+  })
+
+  it('drops the oldest sample once the window is full, so velocity can recover', () => {
+    // Twelve steps: the first two answered with 100 tokens over 2.5s (40 tok/s),
+    // the last ten with 10 tokens over 2.5s (4 tok/s). A whole-log average keeps
+    // the slow-drifting history; the window holds only the recent ten.
+    const events: SessionEvent[] = []
+    for (let index = 0; index < 12; index += 1) {
+      const start = index * 10_000
+      const tokens = index < 2 ? 100 : 10
+      events.push(...step(start, start + 500, start + 3_000, tokens))
+    }
+    const value = fold(events)
+    expect(value.recentSteps).toBe(10)
+    // Only the ten recent samples count: 10 x 10 tokens.
+    expect(value.recentDecodeTokens).toBe(100)
+    // The whole-log totals keep every step.
+    expect(value.decodeTokens).toBe(300)
+  })
+})
+
 describe('sessionStats wall-time fold (controlled timestamps)', () => {
   const message = createMessage({
     role: 'assistant',
@@ -207,6 +334,8 @@ describe('sessionStats wall-time fold (controlled timestamps)', () => {
       at(4_900, 'step/end', { turn: 1, step: 1 }),
     ])).toEqual(totals({
       turns: 1, steps: 1, llmMs: 3_800, ttftMs: 800, ttftSteps: 1, decodeMs: 3_000, decodeTokens: 60,
+      // The one decode-timed step is the whole recent run.
+      recentSteps: 1, recentDecodeMs: 3_000, recentDecodeTokens: 60,
     }))
   })
 

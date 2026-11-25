@@ -57,7 +57,7 @@ function makeSource(init: ChatUpdate = {}) {
   }
 }
 
-describe('deriveStats', () => {
+describe('deriveStats (reference semantics only, not a pill read path)', () => {
   it('counts turns and steps and never folds node usage into accounting', () => {
     const stats = deriveStats([
       assistant(1, 1, { inputTokens: 100, outputTokens: 50, cacheReadTokens: 900 }),
@@ -66,13 +66,16 @@ describe('deriveStats', () => {
     ])
     expect(stats.turns).toBe(2)
     expect(stats.steps).toBe(3)
-    // The window fold's counts are only the fallback for assemblies without
-    // the sessionStats projection; the paged window is not an accounting
-    // source either, so the fold exposes no billing fields (billing rides the
-    // tokenUsage projection); decodeTokens is a throughput input, not a
-    // billed total.
+    // These tests pin how each projected field is DEFINED (the fold mirrors the
+    // projection field for field); no component reads the fold, because the
+    // pills take whole-log figures from the sessionStats projection alone.
+    // Billing rides the tokenUsage projection; decodeTokens is a throughput
+    // input, not a billed total.
     expect(Object.keys(stats).sort()).toEqual(
-      ['decodeMs', 'decodeTokens', 'llmMs', 'steps', 'toolMs', 'ttftMs', 'ttftSteps', 'turns'],
+      [
+        'decodeMs', 'decodeTokens', 'llmMs', 'recentDecodeMs', 'recentDecodeTokens', 'recentSteps',
+        'steps', 'toolMs', 'ttftMs', 'ttftSteps', 'turns',
+      ],
     )
   })
 
@@ -171,18 +174,28 @@ describe('composer stats pills', () => {
     timing: { stepStartTime: 1_000, firstTokenTime: 1_800, completedTime: 4_800 },
   })
 
+  /**
+   * The projection row matching {@link timedStep}: 3.8s model time, 0.8s TTFT,
+   * and 20 tok/s over 60 output tokens. These pills read the whole-log
+   * projection alone, so every case asserting a speed or time figure seeds it.
+   */
+  const timedStats = (): Record<string, number> => sessionStats({
+    turns: 1, steps: 1, llmMs: 3_800, ttftMs: 800, ttftSteps: 1, decodeMs: 3_000, decodeTokens: 60,
+  })
+
   it('compact keeps only speed and cache hit, with no interactive statistics', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
-    const view = render(<StatsPills {...props(source)} usePerformanceUsage={selector => selector('compact')} />)
+    const projectProps = { tokenUsage: USAGE, sessionStats: timedStats() }
+    const view = render(<StatsPills {...props(source, projectProps)} usePerformanceUsage={selector => selector('compact')} />)
     expect(view.container.textContent).toBe('20 tok/sCache hit 90%')
     expect(view.queryByRole('button')).toBeNull()
     fireEvent.mouseOver(view.getByText('20 tok/s'))
     expect(view.queryByRole('dialog')).toBeNull()
-    view.rerender(<StatsPills {...props(source)} />)
+    view.rerender(<StatsPills {...props(source, projectProps)} />)
     expect(view.getAllByRole('button')).toHaveLength(2)
     fireEvent.click(view.getAllByRole('button')[0]!)
     expect(view.getByRole('dialog')).toBeTruthy()
-    view.rerender(<StatsPills {...props(source)} usePerformanceUsage={selector => selector('compact')} />)
+    view.rerender(<StatsPills {...props(source, projectProps)} usePerformanceUsage={selector => selector('compact')} />)
     expect(view.queryByRole('dialog')).toBeNull()
   })
 
@@ -194,9 +207,9 @@ describe('composer stats pills', () => {
 
   it('renders the counts reading and usage pill and hides a brand-new empty session', () => {
     const { source } = makeSource({ nodes: [assistant(1, 1)] })
-    const view = render(<StatsPills {...props(source)} />)
-    // No timing on the fixture: the speed segment drops out and the dialog
-    // would have no rows, so the counts reading stays a static pill (no button).
+    const view = render(<StatsPills {...props(source, { tokenUsage: USAGE, sessionStats: sessionStats({ turns: 1, steps: 1 }) })} />)
+    // No timing in the projection row: the speed segment drops out and the
+    // dialog would have no rows, so the counts reading stays a static pill.
     expect(view.getByText('1 turns 1 steps').closest('button')).toBeNull()
     // Cache hit comes from the projection, so paging the window cannot change
     // it; the usage pill leads with the whole-log token total. Its accessible
@@ -231,21 +244,63 @@ describe('composer stats pills', () => {
     { actual: '100%', tokenUsageValue: tokenUsage(10_000, 0), expected: 'Cache hit 100%' },
   ])('formats an actual $actual cache-hit ratio as $expected', ({ tokenUsageValue, expected }) => {
     const { source } = makeSource({ nodes: [assistant(1, 1)] })
-    const view = render(<StatsPills {...props(source, { tokenUsage: tokenUsageValue })} />)
+    const view = render(<StatsPills {...props(source, {
+      tokenUsage: tokenUsageValue,
+      sessionStats: sessionStats({ turns: 1, steps: 1 }),
+    })} />)
     expect(view.getAllByRole('button')[0]!.textContent).toContain(expected)
   })
 
   it('exposes output speed on the counts pill when decode timing exists', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
-    const view = render(<StatsPills {...props(source)} />)
+    const view = render(<StatsPills {...props(source, { tokenUsage: USAGE, sessionStats: timedStats() })} />)
     const timePill = view.getAllByRole('button')[0]!
     expect(timePill.textContent).toBe('1 turns 1 steps·20 tok/s')
     expect(timePill.getAttribute('aria-label')).toBe('1 turns 1 steps · 20 tok/s')
   })
 
+  it('shows the recent run beside the whole-log average once they diverge', () => {
+    // 120 tok over 4 s recent vs 60 tok over 3 s whole-log: 30 vs 20.
+    const { source } = makeSource({ nodes: [timedStep()] })
+    const view = render(<StatsPills {...props(source, {
+      tokenUsage: USAGE,
+      sessionStats: sessionStats({
+        turns: 1, steps: 4, llmMs: 3_800, ttftMs: 800, ttftSteps: 1, decodeMs: 3_000, decodeTokens: 60,
+        recentSteps: 2, recentDecodeMs: 4_000, recentDecodeTokens: 120,
+      }),
+    })} />)
+    const timePill = view.getAllByRole('button')[0]!
+    // The whole-log average is kept visible so neither figure silently masks the other.
+    expect(timePill.textContent).toBe('1 turns 4 steps·now 30 · avg 20 tok/s')
+  })
+
+  it('collapses to a single reading when the run and the average agree', () => {
+    const { source } = makeSource({ nodes: [timedStep()] })
+    const view = render(<StatsPills {...props(source, {
+      tokenUsage: USAGE,
+      sessionStats: sessionStats({
+        turns: 1, steps: 1, llmMs: 3_800, ttftMs: 800, ttftSteps: 1, decodeMs: 3_000, decodeTokens: 60,
+        recentSteps: 1, recentDecodeMs: 3_000, recentDecodeTokens: 60,
+      }),
+    })} />)
+    expect(view.getAllByRole('button')[0]!.textContent).toBe('1 turns 1 steps·20 tok/s')
+  })
+
+  it('falls back to the whole-log average when no decode-timed step closed yet', () => {
+    // recentSteps 0 (every step was usage-less) must not blank the reading.
+    const { source } = makeSource({ nodes: [assistant(1, 1)] })
+    const view = render(<StatsPills {...props(source, {
+      tokenUsage: USAGE,
+      sessionStats: sessionStats({
+        turns: 1, steps: 1, llmMs: 3_800, ttftMs: 800, ttftSteps: 1, decodeMs: 3_000, decodeTokens: 60,
+      }),
+    })} />)
+    expect(view.getAllByRole('button')[0]!.textContent).toBe('1 turns 1 steps·20 tok/s')
+  })
+
   it('marks each pill with its dock entry id', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
-    const view = render(<StatsPills {...props(source)} />)
+    const view = render(<StatsPills {...props(source, { tokenUsage: USAGE, sessionStats: timedStats() })} />)
     const pills = [...view.container.querySelectorAll('[data-composer-stat]')]
     expect(pills.map(pill => [pill.getAttribute('data-composer-stat'), pill.textContent])).toEqual([
       ['activity', '1 turns 1 steps·20 tok/s'],
@@ -255,7 +310,7 @@ describe('composer stats pills', () => {
 
   it('click-opens the time-and-speed dialog carrying the time split and speeds', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
-    const view = render(<StatsPills {...props(source)} />)
+    const view = render(<StatsPills {...props(source, { tokenUsage: USAGE, sessionStats: timedStats() })} />)
 
     const timePill = view.getAllByRole('button')[0]!
     expect(timePill.getAttribute('aria-haspopup')).toBe('dialog')
@@ -282,7 +337,7 @@ describe('composer stats pills', () => {
 
   it('click-opens the token-usage dialog carrying the headline total and exact buckets', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
-    const view = render(<StatsPills {...props(source)} />)
+    const view = render(<StatsPills {...props(source, { tokenUsage: USAGE, sessionStats: timedStats() })} />)
 
     const usagePill = view.getAllByRole('button')[1]!
     fireEvent.click(usagePill)
@@ -306,7 +361,7 @@ describe('composer stats pills', () => {
 
   it('closes the dialog on Escape or an outside pointerdown', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
-    const view = render(<StatsPills {...props(source)} />)
+    const view = render(<StatsPills {...props(source, { tokenUsage: USAGE, sessionStats: timedStats() })} />)
     const timePill = view.getAllByRole('button')[0]!
 
     fireEvent.click(timePill)
@@ -325,7 +380,7 @@ describe('composer stats pills', () => {
 
   it('keeps at most one dialog open: a sibling pill click swaps, never stacks', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
-    const view = render(<StatsPills {...props(source)} />)
+    const view = render(<StatsPills {...props(source, { tokenUsage: USAGE, sessionStats: timedStats() })} />)
     const [timePill, usagePill] = [...view.getAllByRole('button')] as [HTMLElement, HTMLElement]
 
     fireEvent.click(timePill)
@@ -342,7 +397,7 @@ describe('composer stats pills', () => {
 
   it('swaps dialogs on keyboard activation of a sibling pill, which fires click without pointerdown', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
-    const view = render(<StatsPills {...props(source)} />)
+    const view = render(<StatsPills {...props(source, { tokenUsage: USAGE, sessionStats: timedStats() })} />)
     const [timePill, usagePill] = [...view.getAllByRole('button')] as [HTMLElement, HTMLElement]
     fireEvent.click(timePill)
     // A click inside the panel keeps it open; focus moving away does not close it.
@@ -357,7 +412,7 @@ describe('composer stats pills', () => {
 
   it('takes every pill and dialog label from the active locale', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
-    const view = render(<StatsPills {...props(source, { tokenUsage: tokenUsage(9_995, 5) })} t={t} />)
+    const view = render(<StatsPills {...props(source, { tokenUsage: tokenUsage(9_995, 5), sessionStats: timedStats() })} t={t} />)
     const [timePill, usagePill] = [...view.getAllByRole('button')] as [HTMLElement, HTMLElement]
     expect(timePill.textContent).toBe('1 轮 1 步·20 tok/s')
     // Whole-log total 9995 + 5 + 1 compacts to 10K.
@@ -383,7 +438,10 @@ describe('composer stats pills', () => {
       vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(80)
       vi.useFakeTimers()
       const { source } = makeSource({ nodes: [timedStep()] })
-      return render(<StatsPills {...props(source)} usePerformanceUsage={selector => selector(mode)} />)
+      const cutProps = { tokenUsage: USAGE, sessionStats: timedStats() }
+      return render(
+        <StatsPills {...props(source, cutProps)} usePerformanceUsage={selector => selector(mode)} />,
+      )
     }
     const tooltipText = (view: ReturnType<typeof render>) => view.queryByRole('tooltip')?.textContent ?? null
     afterEach(() => { vi.useRealTimers() })
@@ -434,11 +492,13 @@ describe('composer stats pills', () => {
     expect(pills[0]!.textContent).toBe('105 tok·Cache hit 90%')
   })
 
-  it('drops the usage pill when no projection is composed', () => {
+  it('renders nothing when no projection is composed, never folding the window', () => {
+    // Plan A: the paged window is not a read path for any pill. With the unit
+    // absent the pill renders nothing rather than falling back to an O(n) fold
+    // of the loaded nodes — a partial page cannot reconstruct whole-log figures.
     const { source } = makeSource({ nodes: [assistant(1, 1)] })
     const view = render(<StatsPills {...props(source, {})} />)
-    expect(view.container.textContent).toBe('1 turns 1 steps')
-    // The untimed window has no dialog rows either, so no button renders at all.
+    expect(view.container.textContent).toBe('')
     expect(view.queryAllByRole('button')).toHaveLength(0)
   })
 
@@ -453,7 +513,7 @@ describe('composer stats pills', () => {
     expect(view.getByText('10 turns 89 steps')).toBeTruthy()
   })
 
-  it('treats a defined zero-count projection as empty, not as fallback', () => {
+  it('treats a defined zero-count projection as empty, not as a window reading', () => {
     // A composed unit always serves the key; all-zero genuinely means no
     // closed step in the whole log, so nothing renders on a brand-new session.
     const empty = makeSource()
@@ -545,7 +605,7 @@ describe('composer stats pills', () => {
       renders += 1
       return <StatsPills {...p} />
     }
-    render(<Counting {...props(source)} />)
+    render(<Counting {...props(source, { tokenUsage: USAGE, sessionStats: sessionStats({ turns: 1, steps: 1 }) })} />)
     const before = renders
     // Chunk frames swap partial only; nodes keeps its reference (object-layer contract).
     act(() => { set({ partial: { turn: 1, step: 2, blocks: [{ kind: 'text', text: 'a' }] } }) })

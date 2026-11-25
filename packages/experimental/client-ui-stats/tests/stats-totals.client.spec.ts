@@ -12,6 +12,11 @@ const STATS: SessionStatsProjection = {
   ttftSteps: 8,
   decodeMs: 300_000,
   decodeTokens: 60_000,
+  // Same 200 tok/s rate as the whole-log pair, so a consumer that reads the
+  // recent window instead cannot silently disagree with these totals.
+  recentSteps: 8,
+  recentDecodeMs: 30_000,
+  recentDecodeTokens: 6_000,
 }
 
 const USAGE: TokenUsageProjection = {

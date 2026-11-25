@@ -49,6 +49,39 @@ interface SessionStatsTotals {
 }
 
 /**
+ * Steps retained by the recent-decode window. Ten is long enough that one short
+ * or long step cannot swing the reading, and short enough that the window
+ * follows a real speed change within a screen of messages.
+ */
+const RECENT_DECODE_WINDOW = 10
+
+/** One decode-timed step's contribution to the recent window. */
+interface DecodeSample {
+  /** Decode wall time for the step, ms. */
+  ms: number
+  /** Provider output tokens for the same step. */
+  tokens: number
+}
+
+/**
+ * Recent-decode window: the last {@link RECENT_DECODE_WINDOW} decode-timed
+ * steps, oldest first.
+ *
+ * It answers "how fast is decoding right now", which the monotonic whole-log
+ * average in {@link SessionStatsTotals} cannot: that ratio keeps every step ever
+ * taken, so a session that starts with long answers and continues with short
+ * ones drifts down and never recovers, even when the model is as fast as ever.
+ *
+ * The window is bounded, so it carries history and cannot be an optional
+ * addition — which is exactly why `stateVersion` is 2 and stored rows refold
+ * once. (An earlier "consecutive run" design avoided the bump by depending only
+ * on increments, but it restarts solely at a step that reported no decode
+ * timing; in a session whose steps all report timing it equals the whole-log
+ * average and would fix nothing.)
+ */
+type SessionStatsRecent = DecodeSample[]
+
+/**
  * Fold state: the totals plus the in-flight boundaries they accrue from.
  * Turn numbers are host-assigned and monotonic per session, so a single
  * `lastTurn` slot decides "first closed step of a new turn"; the state is
@@ -61,6 +94,20 @@ interface SessionStatsState extends SessionStatsTotals {
   openStep: { turn: number; step: number; startTime: number; firstTokenTime: number | null } | null
   /** Dispatch times of tool calls whose result has not landed, by callId. */
   pendingCalls: Record<string, number>
+  /**
+   * Recent-decode window, oldest first. Required (not optional) because
+   * `stateVersion` 2 already invalidates every row written without it, and an
+   * explicit array avoids Zod's optional output, which
+   * `exactOptionalPropertyTypes` rejects for a `recent?:` field.
+   */
+  recent: SessionStatsRecent
+  /**
+   * The recently closed step whose decode the window has not folded yet; it is
+   * created by `assistant/message` and consumed by the following `step/end`,
+   * because decode timing belongs to the message while the step is the counted
+   * boundary. `null` while no such step is pending.
+   */
+  recentPending: { decodeMs: number; decodeTokens: number | null } | null
 }
 
 const sessionStatsSchema = z.object({
@@ -89,6 +136,16 @@ const sessionStatsStateSchema = sessionStatsSchema.extend({
     firstTokenTime: z.number().nonnegative().nullable(),
   }).nullable(),
   pendingCalls: z.record(z.string(), z.number().nonnegative()),
+  // Required: `stateVersion` 2 invalidates every row written without them, so a
+  // v1 row fails this schema and refolds instead of being read as a short window.
+  recent: z.array(z.object({
+    ms: z.number().nonnegative(),
+    tokens: z.number().nonnegative(),
+  })).max(RECENT_DECODE_WINDOW),
+  recentPending: z.object({
+    decodeMs: z.number().nonnegative(),
+    decodeTokens: z.number().nonnegative().nullable(),
+  }).nullable(),
 })
 
 /**
@@ -106,7 +163,14 @@ function usageOutputTokens(usage: unknown): number | null {
 /** The `sessionStats` unit registered on `ctx.sessionProjections` (exported for the unit spec). */
 export const sessionStatsProjectionDefinition = {
   key: 'sessionStats',
-  stateVersion: 1,
+  /**
+   * Bumped to 2 by the recent-decode window. A bounded window carries history,
+   * so it cannot be an optional addition: a row written before the field existed
+   * has no window to continue from, and replaying a tail over it cannot equal a
+   * full fold. The contract requires a bump in exactly that case, so stored rows
+   * refold once.
+   */
+  stateVersion: 2,
   stateSchema: sessionStatsStateSchema,
   init: () => ({
     turns: 0,
@@ -120,6 +184,8 @@ export const sessionStatsProjectionDefinition = {
     lastTurn: null,
     openStep: null,
     pendingCalls: {},
+    recent: [],
+    recentPending: null,
   }),
   apply: (state, event) => {
     // Every uninteresting event returns the same reference (Object.is gates the change feed).
@@ -155,6 +221,11 @@ export const sessionStatsProjectionDefinition = {
             next.decodeMs += Math.max(0, event.time - firstToken)
             next.decodeTokens += outputTokens
           }
+          // Hand the decode reading to the step/end that closes this step: the
+          // run counts step boundaries, so only there does a step join it.
+          next.recentPending = { decodeMs: Math.max(0, event.time - firstToken), decodeTokens: outputTokens }
+        } else {
+          next.recentPending = null
         }
         return next
       }
@@ -173,14 +244,26 @@ export const sessionStatsProjectionDefinition = {
         )
         return { ...state, toolMs: state.toolMs + Math.max(0, event.time - dispatched), pendingCalls }
       }
-      case 'step/end':
+      case 'step/end': {
+        const turns = state.lastTurn === event.data.turn ? state.turns : state.turns + 1
+        // A step that reported decode timing joins the window; one that did not
+        // (cancelled before a message assembled, or no usage) contributes
+        // nothing and leaves the window intact, so tool-only steps do not blank
+        // the reading.
+        const pending = state.recentPending
+        const recent: SessionStatsRecent = pending !== null && pending.decodeTokens !== null && pending.decodeMs > 0
+          ? [...state.recent, { ms: pending.decodeMs, tokens: pending.decodeTokens }].slice(-RECENT_DECODE_WINDOW)
+          : state.recent
         return {
           ...state,
-          turns: state.lastTurn === event.data.turn ? state.turns : state.turns + 1,
+          turns,
           steps: state.steps + 1,
           lastTurn: event.data.turn,
           openStep: null,
+          recent,
+          recentPending: null,
         }
+      }
       case 'turn/end':
         // A call whose result never landed belongs to a cancelled or failed
         // turn; results always land within their turn, so drop the leftovers
@@ -191,17 +274,34 @@ export const sessionStatsProjectionDefinition = {
     }
   },
   wire: {
-    viewSchema: sessionStatsSchema,
-    view: state => ({
-      turns: state.turns,
-      steps: state.steps,
-      llmMs: state.llmMs,
-      toolMs: state.toolMs,
-      ttftMs: state.ttftMs,
-      ttftSteps: state.ttftSteps,
-      decodeMs: state.decodeMs,
-      decodeTokens: state.decodeTokens,
-    }),
+    viewSchema: sessionStatsSchema.extend({
+      recentSteps: z.number().int().nonnegative(),
+      recentDecodeMs: z.number().nonnegative(),
+      recentDecodeTokens: z.number().nonnegative(),
+    }).strict(),
+    view: (state) => {
+      let recentSteps = 0
+      let recentDecodeMs = 0
+      let recentDecodeTokens = 0
+      for (const sample of state.recent) {
+        recentSteps += 1
+        recentDecodeMs += sample.ms
+        recentDecodeTokens += sample.tokens
+      }
+      return {
+        turns: state.turns,
+        steps: state.steps,
+        llmMs: state.llmMs,
+        toolMs: state.toolMs,
+        ttftMs: state.ttftMs,
+        ttftSteps: state.ttftSteps,
+        decodeMs: state.decodeMs,
+        decodeTokens: state.decodeTokens,
+        recentSteps,
+        recentDecodeMs,
+        recentDecodeTokens,
+      }
+    },
     summary: false,
   },
 } satisfies ProjectionDefinition<'sessionStats', SessionStatsState>

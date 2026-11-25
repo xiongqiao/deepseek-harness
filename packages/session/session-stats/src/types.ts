@@ -38,6 +38,20 @@ export interface SessionStatsProjection {
   decodeMs: number
   /** Summed provider output tokens over the same decode-timed steps. */
   decodeTokens: number
+  /**
+   * Steps in the most recent uninterrupted run of decode-timed steps.
+   *
+   * The `decode*` totals above are monotonic whole-log sums, so their ratio
+   * drifts toward older, denser steps and never recovers when decode briefly
+   * slows. This run answers "how fast is decoding right now": it restarts at
+   * the latest step that reported no decode timing (a cancelled or usage-less
+   * step), so it never averages across a gap.
+   */
+  recentSteps: number
+  /** Summed decode wall time over `recentSteps`; 0 when the run is empty. */
+  recentDecodeMs: number
+  /** Summed output tokens over `recentSteps`; 0 when the run is empty. */
+  recentDecodeTokens: number
 }
 
 declare module '@deepseek-ai/dsh-session-projection/types' {

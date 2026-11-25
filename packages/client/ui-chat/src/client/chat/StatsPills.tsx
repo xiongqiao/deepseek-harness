@@ -1,10 +1,11 @@
 // Composer statistics pills, each its own 'conversation.composer.dock' list
 // entry (activity, usage) so a plugin can replace or add one pill by id.
 // Compact keeps speed and cache hit as plain readings; Detailed adds counts,
-// token totals, and click-open dialogs. Settled-node identity prevents
-// stream-delta updates from rerendering the pills.
+// token totals, and click-open dialogs. Every figure rides a durable session
+// projection, never the paged window, so neither paging nor compaction can
+// rescope a reading and no pill subscribes to the loaded nodes.
 
-import { memo, useMemo, type ReactNode } from 'react'
+import { memo, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { IconDatabaseOutlineRegular, IconGaugeOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { UseProjection } from '@deepseek-ai/dsh-api-session-controller/client'
@@ -21,6 +22,9 @@ import { useStatDialog } from './stat-dialog.ts'
 import css from './StatsPills.module.css'
 import dialogCss from './stat-dialog.module.css'
 
+/** Decode-timed steps the recent window keeps; mirrors RECENT_DECODE_WINDOW in the projection. */
+const RECENT_DECODE_WINDOW = 10
+
 interface WindowStats {
   turns: number
   steps: number
@@ -36,19 +40,27 @@ interface WindowStats {
   decodeMs: number
   /** Summed output tokens over the same decode-timed steps. */
   decodeTokens: number
+  /** Steps in the most recent uninterrupted decode-timed run. */
+  recentSteps: number
+  /** Decode wall time over that run. */
+  recentDecodeMs: number
+  /** Output tokens over that run. */
+  recentDecodeTokens: number
 }
 
 /**
- * Fold assistant and tool-result nodes into window-scoped display totals —
- * the FALLBACK for assemblies without the `sessionStats` projection.
+ * Fold assistant and tool-result nodes into window-scoped totals — the
+ * reference semantics for the projected figures, NOT a pill read path.
  *
- * Every displayed figure rides that durable whole-log projection (and token
- * accounting rides `tokenUsage`) because the window is paged and compaction
- * rewrites it; this fold answers "what is on screen" only when no projection
- * value is served. Its field names deliberately mirror the projection's so
- * the two swap wholesale.
+ * It remains exported for the unit tests that pin each projected field's
+ * definition (turns counted per distinct turn, ttft per timed step, decode
+ * only over usage-carrying steps, tool time paired by call time), but no
+ * component calls it: {@link useSessionStats} reads the `sessionStats`
+ * projection alone. Folding a PAGED window yields the wrong answer for these
+ * whole-log figures and costs an O(n) scan of every loaded node, so it must
+ * not come back as a fallback.
  * @param nodes - snapshot nodes.
- * @returns fallback counts and summed wall times.
+ * @returns window-scoped counts and summed wall times.
  */
 export function deriveStats(nodes: ChatSnapshot['legacy']['nodes']): WindowStats {
   const turns = new Set<number>()
@@ -59,6 +71,7 @@ export function deriveStats(nodes: ChatSnapshot['legacy']['nodes']): WindowStats
   let ttftSteps = 0
   let decodeMs = 0
   let decodeTokens = 0
+  const decodings: { ms: number; tokens: number }[] = []
   for (const node of nodes) {
     if (node.kind === 'tool-result') {
       if (node.callTime !== null) toolMs += Math.max(0, node.time - node.callTime)
@@ -75,12 +88,30 @@ export function deriveStats(nodes: ChatSnapshot['legacy']['nodes']): WindowStats
       ttftMs += reading.ttftMs
       ttftSteps += 1
     }
-    if (reading.decodeMs !== null && reading.outputTokens !== null) {
-      decodeMs += reading.decodeMs
-      decodeTokens += reading.outputTokens
+    // One entry per decode-timed step, in order: the window keeps the last
+    // RECENT_DECODE_WINDOW of them, and steps without decode timing are skipped
+    // rather than breaking the run (mirroring the projection's window).
+    const stepDecodeMs = reading.decodeMs
+    const stepTokens = reading.outputTokens
+    if (stepDecodeMs !== null && stepTokens !== null) {
+      decodeMs += stepDecodeMs
+      decodeTokens += stepTokens
+      decodings.push({ ms: stepDecodeMs, tokens: stepTokens })
     }
   }
-  return { turns: turns.size, steps, llmMs, toolMs, ttftMs, ttftSteps, decodeMs, decodeTokens }
+  const window = decodings.slice(-RECENT_DECODE_WINDOW)
+  let recentSteps = 0
+  let recentDecodeMs = 0
+  let recentDecodeTokens = 0
+  for (const entry of window) {
+    recentSteps += 1
+    recentDecodeMs += entry.ms
+    recentDecodeTokens += entry.tokens
+  }
+  return {
+    turns: turns.size, steps, llmMs, toolMs, ttftMs, ttftSteps, decodeMs, decodeTokens,
+    recentSteps, recentDecodeMs, recentDecodeTokens,
+  }
 }
 
 /**
@@ -159,20 +190,51 @@ function reading(first: string, second: string | null): Pick<PillContent, 'label
   }
 }
 
-// Every figure rides the durable sessionStats projection, so paging and
-// compaction cannot change any of them; an assembly without the unit falls
-// back to the window-scoped fold wholesale (same field names), paid only
-// while no projection value is served.
-function useSessionStats(useChat: StatPillProps['useChat'], useProjection: UseProjection): WindowStats {
-  const settledNodes = useChat(s => s.legacy.nodes)
-  const projected = useProjection('sessionStats')
-  return useMemo(() => projected ?? deriveStats(settledNodes), [projected, settledNodes])
+/**
+ * Every figure rides the durable `sessionStats` projection, so paging and
+ * compaction cannot change any of them, and this pill subscribes to no part of
+ * the paged window: without the projection value there is nothing durable to
+ * show, so the pill renders nothing rather than folding the loaded window.
+ *
+ * The window fold (`deriveStats`) is deliberately NOT a read path. It walked
+ * every settled node on each recomputation, which put an O(n) scan of the whole
+ * loaded window on the composer dock of long sessions. Its per-field semantics
+ * stay pinned by the unit tests, and folding a paged window is the wrong answer
+ * for these figures anyway: the counts, time split, and throughput are
+ * whole-log facts that a partial page cannot reconstruct.
+ *
+ * `dsh-session-stats` is a declared dependency of this package and is composed
+ * by every official assembly, so the absent-value branch is the cold-start
+ * window before the unit serves a value, not a supported operating mode.
+ *
+ * @param useProjection - projection read seat; the only data source.
+ * @returns the whole-log figures, or `null` while the projection serves none.
+ */
+function useSessionStats(useProjection: UseProjection): WindowStats | null {
+  return useProjection('sessionStats') ?? null
 }
 
-function decodeSpeed(stats: WindowStats, t: Translate): string {
-  return t('message.tokensPerSecond', {
-    tps: formatTokensPerSecond(stats.decodeTokens / (stats.decodeMs / 1_000)),
-  })
+/**
+ * The speed reading. Recent-run throughput answers "how fast now" and is shown
+ * first because the whole-log ratio drifts toward older, denser steps and can
+ * never climb back; the whole-log average follows whenever the two differ, so
+ * neither figure is silently the other. A run of 0 means no decode-timed step
+ * closed yet, in which case only the whole-log figure (or nothing) remains.
+ *
+ * @param stats - whole-log figures plus the recent run.
+ * @param t - translate seat supplying the speed reading.
+ * @returns the reading text, or null when no figure is available.
+ */
+function decodeSpeed(stats: WindowStats, t: Translate): string | null {
+  const recent = stats.recentSteps > 0 && stats.recentDecodeMs > 0
+    ? formatTokensPerSecond(stats.recentDecodeTokens / (stats.recentDecodeMs / 1_000))
+    : null
+  const whole = stats.decodeMs > 0
+    ? formatTokensPerSecond(stats.decodeTokens / (stats.decodeMs / 1_000))
+    : null
+  if (recent === null) return whole === null ? null : t('message.tokensPerSecond', { tps: whole })
+  if (whole === null || recent === whole) return t('message.tokensPerSecond', { tps: recent })
+  return t('message.tokensPerSecondRecent', { recent, whole })
 }
 
 /** The full reading above a pill, only while an ellipsis cuts its label; the delay matches the dock's context meter. */
@@ -246,12 +308,15 @@ function DialogPill({ stat, icon, label, text, title, titleValue, children }: Pi
 
 /**
  * Turn and step counts with whole-session speed, opening the time and speed
- * dialog; Compact keeps only the speed reading.
+ * dialog; Compact keeps only the speed reading. Renders nothing until the
+ * `sessionStats` projection serves a value, since the paged window is not an
+ * accounting source (see {@link useSessionStats}).
  */
-export const ActivityPill = memo(function ActivityPill({ useChat, useProjection, usePerformanceUsage, t }: StatPillProps) {
+export const ActivityPill = memo(function ActivityPill({ useProjection, usePerformanceUsage, t }: StatPillProps) {
   const mode = usePerformanceUsage(value => value)
-  const stats = useSessionStats(useChat, useProjection)
-  const speed = stats.decodeMs > 0 ? decodeSpeed(stats, t) : null
+  const stats = useSessionStats(useProjection)
+  if (stats === null) return null
+  const speed = decodeSpeed(stats, t)
   const icon = <IconGaugeOutlineRegular />
   if (mode === 'compact') return speed === null ? null : <PlainPill stat="activity" icon={icon} {...reading(speed, null)} />
   if (stats.steps === 0) return null
